@@ -1,0 +1,122 @@
+---
+- name: Install Kubernetes with Containerd and Configure Nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Disable swap
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: Nuke swap from orbit.(Its the only way to be sure)
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ item }}"
+      with_items:
+        - "{{ ansible_mounts | selectattr('fstype', 'equalto', 'swap') | map(attribute='device') | list | map('regex_replace', '(.*)', '#\\1') | list }}"
+
+    - name: Install prereq packages for k8s setup
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+
+    - name: Add Docker's official GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Update apt and install Containerd
+      apt:
+        name: containerd.io
+        state: present
+
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Create k8s.conf file
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+        dest: /etc/sysctl.d/k8s.conf
+
+    - name: Apply sysctl settings
+      shell: sysctl --system
+
+    - name: Configure containerd
+      shell: echo "config default" | sudo tee /etc/containerd/config.toml
+
+    #Now install k8s packages. I seperate these just for sanity.
+
+    - name: Add Kubernetes apt key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+
+    - name: Update apt repositories
+      apt:
+        update_cache: yes
+
+    - name: Install kubeadm, kubelet, kubectl
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+
+    - name: Set SystemdCgroup to true in config.toml if not already set
+      lineinfile:
+        path: /etc/containerd/config.toml
+        line: "  SystemdCgroup = true"
+        insertafter: EOF
+        state: present
+        backup: yes
+        regexp: "^  SystemdCgroup = false"
+
+    - name: Enable and start kubelet and containerd services
+      service:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - kubelet
+        - containerd
+
+    #TODO put this in a block and add a rescue task to kubeadm reset and blow away /etc/kubernetes so we can start over.
+
+    - name: Initialize the cluster
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16
+      when: "'master' in group_names and inventory_hostname in groups['master']"
+
+    - name: Set up Weave as CNI
+      shell: kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command
+      when: "'worker' in group_names and inventory_hostname in groups['workers']"
+
+    - name: Join worker nodes to the cluster
+      shell: "{{ join_command.stdout }}"
+      when: "'worker' in group_names and inventory_hostname in groups['workers']"
